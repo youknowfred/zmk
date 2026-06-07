@@ -882,6 +882,15 @@ static void split_central_device_found(const bt_addr_le_t *addr, int8_t rssi, ui
     }
 }
 
+// Skinner39 fix for ZMK #718/#2776: a failed bt_le_scan_start() (the Zephyr
+// controller routinely rejects one issued straight from a disconnect/connect
+// callback: -EALREADY/-EADDRINUSE/-ENOMEM) used to leave is_scanning stuck true,
+// so every later start_scanning() early-returned "already running" and the central
+// never reconnected to a dropped peripheral until it was power-cycled. Retry the
+// scan from a work-queue context (out of the BT callback) until it takes.
+static void scan_retry_work_cb(struct k_work *work) { start_scanning(); }
+static K_WORK_DELAYABLE_DEFINE(scan_retry_work, scan_retry_work_cb);
+
 static int start_scanning(void) {
     if (!is_enabled) {
         LOG_DBG("Not scanning, we're disabled");
@@ -911,7 +920,12 @@ static int start_scanning(void) {
     is_scanning = true;
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, split_central_device_found);
     if (err < 0) {
-        LOG_ERR("Scanning failed to start (err %d)", err);
+        // Don't leave is_scanning stuck true (it would make every future
+        // start_scanning() early-return "already running"). Clear it and retry
+        // shortly from the system work queue, where the controller accepts it.
+        LOG_ERR("Scanning failed to start (err %d), retrying in 500ms", err);
+        is_scanning = false;
+        k_work_reschedule(&scan_retry_work, K_MSEC(500));
         return err;
     }
 

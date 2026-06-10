@@ -312,7 +312,6 @@ static uint8_t peripheral_input_event_notify_cb(struct bt_conn *conn,
         return BT_GATT_ITER_STOP;
     }
 
-    LOG_DBG("[INPUT EVENT] data %p length %u", data, length);
 
     if (length != sizeof(struct zmk_split_input_event_payload)) {
         LOG_WRN("Ignoring input event notify with incorrect data length (%d)", length);
@@ -1363,7 +1362,6 @@ static int finish_init() {
 void peripheral_event_work_callback(struct k_work *work) {
     struct peripheral_event_wrapper ev;
     while (k_msgq_get(&peripheral_event_msgq, &ev, K_NO_WAIT) == 0) {
-        LOG_DBG("Trigger key position state change of type %d", ev.event.type);
         zmk_split_transport_central_peripheral_event_handler(&bt_central, ev.source, ev.event);
     }
 }

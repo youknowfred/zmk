@@ -248,7 +248,6 @@ static int send_consumer_report(void) {
 }
 
 int zmk_endpoint_send_report(uint16_t usage_page) {
-    LOG_DBG("usage page 0x%02X", usage_page);
     switch (usage_page) {
     case HID_USAGE_KEY:
         return send_keyboard_report();
@@ -429,22 +428,18 @@ static enum zmk_transport get_selected_transport(void) {
 
     case ZMK_TRANSPORT_USB:
         if (is_usb_ready()) {
-            LOG_DBG("USB is preferred and ready");
             return ZMK_TRANSPORT_USB;
         }
         if (is_ble_ready()) {
-            LOG_DBG("USB is not ready. Falling back to BLE");
             return ZMK_TRANSPORT_BLE;
         }
         break;
 
     case ZMK_TRANSPORT_BLE:
         if (is_ble_ready()) {
-            LOG_DBG("BLE is preferred and ready");
             return ZMK_TRANSPORT_BLE;
         }
         if (is_usb_ready()) {
-            LOG_DBG("BLE is not ready. Falling back to USB");
             return ZMK_TRANSPORT_USB;
         }
         break;

@@ -488,7 +488,11 @@ static int split_central_subscribe(struct bt_conn *conn, struct bt_gatt_subscrib
         LOG_DBG("[SUBSCRIBED]");
         break;
     default:
-        LOG_ERR("Subscribe failed (err %d)", err);
+        // Skinner39 fix (ZMK #718/#2776 family): callers ignore this return, so a
+        // failed subscribe used to leave the characteristic permanently mute on a
+        // live link. Tear down and let the reconnect cycle retry.
+        LOG_ERR("Subscribe failed (err %d), disconnecting split link to retry", err);
+        bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         break;
     }
 
@@ -740,7 +744,12 @@ static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
 
     int err = bt_gatt_discover(conn, &slot->discover_params);
     if (err) {
-        LOG_ERR("Failed to start discovering split service characteristics (err %d)", err);
+        // Skinner39 fix (ZMK #718/#2776 family): see split_central_process_connection —
+        // a stalled discovery chain must not leave a mute-but-connected split.
+        LOG_ERR("Failed to start discovering split service characteristics (err %d), "
+                "disconnecting split link to retry",
+                err);
+        bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
     }
     return BT_GATT_ITER_STOP;
 }
@@ -765,7 +774,13 @@ static void split_central_process_connection(struct bt_conn *conn) {
 
         err = bt_gatt_discover(slot->conn, &slot->discover_params);
         if (err) {
-            LOG_ERR("Discover failed(err %d)", err);
+            // Skinner39 fix (ZMK #718/#2776 family): returning here left the link
+            // up but mute (no subscriptions), and with the slot occupied the
+            // central stops scanning — a permanent "connected but dead" split.
+            // Tear the connection down so the disconnect path releases the slot
+            // and the reconnect cycle retries cleanly.
+            LOG_ERR("Discover failed (err %d), disconnecting split link to retry", err);
+            bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
             return;
         }
     }
@@ -780,6 +795,45 @@ static void split_central_process_connection(struct bt_conn *conn) {
     // Restart scanning if necessary.
     start_scanning();
 }
+
+// Skinner39 fix for ZMK #718/#2776: a failed bt_le_scan_start() (the Zephyr
+// controller routinely rejects one issued straight from a disconnect/connect
+// callback: -EALREADY/-EADDRINUSE/-ENOMEM) used to leave is_scanning stuck true,
+// so every later start_scanning() early-returned "already running" and the central
+// never reconnected to a dropped peripheral until it was power-cycled. Retry the
+// scan from a work-queue context (out of the BT callback) until it takes.
+static void scan_retry_work_cb(struct k_work *work) { start_scanning(); }
+static K_WORK_DELAYABLE_DEFINE(scan_retry_work, scan_retry_work_cb);
+
+// Skinner39 fix (ZMK #718/#2776 family), defense in depth: if anything leaves a
+// split connection up without completed discovery + subscriptions (the symptom:
+// split "connected" but no key/sensor traffic), tear it down so the normal
+// reconnect cycle gets another shot. Armed on every central-role connect; a
+// healthy link is fully subscribed long before this fires. Battery-level
+// subscription is deliberately not required — it must not flap the link.
+static void subscription_watchdog_cb(struct k_work *work) {
+    for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
+        struct peripheral_slot *slot = &peripherals[i];
+        if (slot->state != PERIPHERAL_SLOT_STATE_CONNECTED || slot->conn == NULL) {
+            continue;
+        }
+
+        bool subscribed = slot->run_behavior_handle && slot->subscribe_params.value_handle &&
+                          slot->selected_physical_layout_handle;
+#if ZMK_KEYMAP_HAS_SENSORS
+        subscribed = subscribed && slot->sensor_subscribe_params.value_handle;
+#endif /* ZMK_KEYMAP_HAS_SENSORS */
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
+        subscribed = subscribed && slot->update_hid_indicators;
+#endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
+
+        if (!subscribed) {
+            LOG_WRN("Split conn %d still not fully subscribed; disconnecting to retry", i);
+            bt_conn_disconnect(slot->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        }
+    }
+}
+static K_WORK_DELAYABLE_DEFINE(subscription_watchdog_work, subscription_watchdog_cb);
 
 static int stop_scanning(void) {
     LOG_DBG("Stopping peripheral scanning");
@@ -810,6 +864,14 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
     // Stop scanning so we can connect to the peripheral device.
     int err = stop_scanning();
     if (err < 0) {
+        // Skinner39 fix (ZMK #718/#2776 family): bailing here used to strand the
+        // just-reserved slot in CONNECTING — every future reserve_peripheral_slot()
+        // then returns -ENOMEM and, with no scan running and nothing armed to retry,
+        // the central is wedged until power-cycle. Release the slot and retry the
+        // whole scan cycle from the work queue.
+        LOG_WRN("Scan stop failed (err %d); releasing slot %d and retrying scan", err, slot_idx);
+        release_peripheral_slot(slot_idx);
+        k_work_reschedule(&scan_retry_work, K_MSEC(500));
         return false;
     }
 
@@ -882,15 +944,6 @@ static void split_central_device_found(const bt_addr_le_t *addr, int8_t rssi, ui
     }
 }
 
-// Skinner39 fix for ZMK #718/#2776: a failed bt_le_scan_start() (the Zephyr
-// controller routinely rejects one issued straight from a disconnect/connect
-// callback: -EALREADY/-EADDRINUSE/-ENOMEM) used to leave is_scanning stuck true,
-// so every later start_scanning() early-returned "already running" and the central
-// never reconnected to a dropped peripheral until it was power-cycled. Retry the
-// scan from a work-queue context (out of the BT callback) until it takes.
-static void scan_retry_work_cb(struct k_work *work) { start_scanning(); }
-static K_WORK_DELAYABLE_DEFINE(scan_retry_work, scan_retry_work_cb);
-
 static int start_scanning(void) {
     if (!is_enabled) {
         LOG_DBG("Not scanning, we're disabled");
@@ -957,9 +1010,18 @@ static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
 
     LOG_DBG("Connected: %s", addr);
 
-    confirm_peripheral_slot_conn(conn);
+    // Skinner39 fix (ZMK #718/#2776 family): a connect that raced slot release
+    // has no slot to land in; process_connection would just log and leave an
+    // unsupervised live conn behind. Tear it down and rescan instead.
+    if (confirm_peripheral_slot_conn(conn) < 0) {
+        LOG_WRN("Connected with no reserved peripheral slot, disconnecting to retry");
+        bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        return;
+    }
+
     split_central_process_connection(conn);
     k_work_submit(&notify_status_work);
+    k_work_reschedule(&subscription_watchdog_work, K_SECONDS(10));
 }
 
 static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {

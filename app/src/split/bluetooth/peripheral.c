@@ -75,14 +75,25 @@ static int start_advertising(bool low_duty) {
 static bool low_duty_advertising = false;
 static bool enabled = false;
 
+// Skinner39 fix (ZMK #718/#2776 family): advertising restart was single-shot —
+// one transient bt_le_adv_start() failure (e.g. directed advertising while the
+// stale connection object is still draining in the controller) silenced the
+// peripheral until power-cycle. Make the work item delayable and self-retry
+// until the start takes; -EALREADY means advertising is already live.
+static void advertising_cb(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(advertising_work, advertising_cb);
+
 static void advertising_cb(struct k_work *work) {
+    if (!enabled || is_connected) {
+        return;
+    }
+
     const int err = start_advertising(low_duty_advertising);
-    if (err < 0) {
-        LOG_ERR("Failed to start advertising (%d)", err);
+    if (err < 0 && err != -EALREADY) {
+        LOG_ERR("Failed to start advertising (%d), retrying in 1s", err);
+        k_work_reschedule(&advertising_work, K_SECONDS(1));
     }
 }
-
-K_WORK_DEFINE(advertising_work, advertising_cb);
 
 static void connected(struct bt_conn *conn, uint8_t err) {
     is_connected = (err == 0);
@@ -92,14 +103,14 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 
     if (err == BT_HCI_ERR_ADV_TIMEOUT && enabled) {
         low_duty_advertising = true;
-        k_work_submit(&advertising_work);
+        k_work_reschedule(&advertising_work, K_NO_WAIT);
     }
 }
 
 static void recycled(void) {
     if (enabled) {
         low_duty_advertising = false;
-        k_work_submit(&advertising_work);
+        k_work_reschedule(&advertising_work, K_NO_WAIT);
     }
 }
 
@@ -114,6 +125,17 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
 
     raise_zmk_split_peripheral_status_changed(
         (struct zmk_split_peripheral_status_changed){.connected = is_connected});
+
+    // Skinner39 fix (ZMK #718/#2776 family): advertising restart used to hinge
+    // solely on the .recycled callback (fires only when the dead conn object
+    // returns to the pool). If that is delayed or lost, the peripheral never
+    // advertises again. Rearm here as a backstop — recycled's immediate
+    // reschedule wins the race in the normal case, and advertising_cb guards
+    // against running while connected/disabled.
+    if (enabled) {
+        low_duty_advertising = false;
+        k_work_reschedule(&advertising_work, K_SECONDS(2));
+    }
 }
 
 static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err) {
@@ -174,9 +196,11 @@ static int split_peripheral_bt_set_enabled(bool en) {
 
     enabled = en;
     if (en) {
-        k_work_submit(&advertising_work);
+        k_work_reschedule(&advertising_work, K_NO_WAIT);
         return 0;
     } else {
+        k_work_cancel_delayable(&advertising_work);
+
         struct bt_conn *conn = NULL;
         bt_conn_foreach(BT_CONN_TYPE_LE, find_first_conn, &conn);
         if (conn) {

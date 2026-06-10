@@ -518,7 +518,9 @@ static void connected(struct bt_conn *conn, uint8_t err) {
         return;
     }
 
-    LOG_DBG("Connected %s", addr);
+    // Flight-recorder promotion (2026-06-11): host-link lifecycle at INF (see
+    // split/bluetooth/central.c note).
+    LOG_INF("Connected %s", addr);
 
     update_advertising();
 
@@ -534,7 +536,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-    LOG_DBG("Disconnected from %s (reason 0x%02x)", addr, reason);
+    LOG_INF("Disconnected from %s (reason 0x%02x)", addr, reason);
 
     bt_conn_get_info(conn, &info);
 

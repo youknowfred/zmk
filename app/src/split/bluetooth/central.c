@@ -836,7 +836,7 @@ static void subscription_watchdog_cb(struct k_work *work) {
 static K_WORK_DELAYABLE_DEFINE(subscription_watchdog_work, subscription_watchdog_cb);
 
 static int stop_scanning(void) {
-    LOG_DBG("Stopping peripheral scanning");
+    LOG_INF("Stopping peripheral scanning");
     is_scanning = false;
 
     int err = bt_le_scan_stop();
@@ -875,7 +875,7 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
         return false;
     }
 
-    LOG_DBG("Initiating new connection");
+    LOG_INF("Initiating new connection");
     struct bt_le_conn_param *param =
         BT_LE_CONN_PARAM(CONFIG_ZMK_SPLIT_BLE_PREF_INT, CONFIG_ZMK_SPLIT_BLE_PREF_INT,
                          CONFIG_ZMK_SPLIT_BLE_PREF_LATENCY, CONFIG_ZMK_SPLIT_BLE_PREF_TIMEOUT);
@@ -982,7 +982,7 @@ static int start_scanning(void) {
         return err;
     }
 
-    LOG_DBG("Scanning successfully started");
+    LOG_INF("Scanning successfully started");
     return 0;
 }
 
@@ -1008,7 +1008,10 @@ static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
         return;
     }
 
-    LOG_DBG("Connected: %s", addr);
+    // Flight-recorder promotion (2026-06-11): split-link lifecycle at INF so the
+    // low-volume USB-logging build captures it (DBG saturates the legacy USB
+    // stack's CDC and kills the bus — see config repo docs 2026-06-10 §5).
+    LOG_INF("Connected: %s", addr);
 
     // Skinner39 fix (ZMK #718/#2776 family): a connect that raced slot release
     // has no slot to land in; process_connection would just log and leave an
@@ -1030,7 +1033,7 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-    LOG_DBG("Disconnected: %s (reason %d)", addr, reason);
+    LOG_INF("Disconnected: %s (reason %d)", addr, reason);
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     struct peripheral_event_wrapper ev = {

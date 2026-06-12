@@ -1052,7 +1052,11 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     err = release_peripheral_slot_for_conn(conn);
 
-    if (err < 0) {
+    if (err == -EINVAL) {
+        /* Not a tracked peripheral: on the central this callback also fires
+         * for the host link, which never had a slot. Not a fault. */
+        LOG_DBG("Disconnected conn had no peripheral slot");
+    } else if (err < 0) {
         LOG_WRN("Failed to release peripheral slot (%d)", err);
     }
 
